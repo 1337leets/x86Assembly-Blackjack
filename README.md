@@ -2,11 +2,12 @@
 
 A fully functional Blackjack game written in bare-metal x86 Assembly (NASM) for 32-bit Linux — no libraries, no runtime, just syscalls.
 
-<p align="center">
-  <img src="preview/gameplay.png" alt="Gameplay" style="vertical-align: middle;"/>
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="preview/gameplay2.png" alt="Gameplay - Edge Cases" style="vertical-align: middle;"/>
-</p>
+## Screenshots
+
+<table align="center"><tr>
+<td align="center" valign="middle"><img src="preview/gameplay.png" alt="Gameplay"></td>
+<td align="center" valign="middle"><img src="preview/gameplay2.png" alt="Edge Cases"></td>
+</tr></table>
 
 ---
 
