@@ -40,7 +40,7 @@ section .data
 	invalid_action_msg db "Please select an option!",0Ah,0
 	invalid_action_msg_len equ $ - invalid_action_msg
 
-	; optional: clear screen ANSI (kullanmak istersen)
+	; optional: clear screen ANSI (belki sonrasında eklerim)
 	clear_screen db 0x1B, "[2J", 0x1B, "[H", 0
 	clear_screen_len equ $ - clear_screen
 
@@ -133,7 +133,7 @@ ascii_to_int:
 
 draw_card:
     rdtsc                   ; EDX:EAX = time‐stamp counter
-    ; → sadece EAX’in alt yarısını kullanılacak:
+    ; sadece EAX’in alt yarısını kullanılacak:
     xor edx, edx            ; EDX = 0
     mov ecx, deck_size      ; bölen = 52
     div ecx                 ; EAX = quotient, EDX = remainder (0..51)
@@ -202,7 +202,7 @@ calc_set_player_flags:
     mov byte [player_natural], 0
 .p_nat_done:
 
-    ; SIX-CARD? (>=6 kart && score <= 21)
+    ; SIX-CARD-CHARLIE? (>=6 kart && score <= 21)
     cmp ebx, 6
     jb .p_six0
     cmp eax, 21
@@ -397,7 +397,7 @@ print_hand_state:
 .dealer_first_10:
     mov dl, '1'
     call small_write
-    ; write '0' separately (small_write writes one char; we want "10")
+    ; write '0' separately (small_write writes one char; we want "10" here)
     mov dl, '0'
     call small_write
     jmp .dealer_after_first
@@ -556,7 +556,7 @@ start_round:
     mov [player_ace_count], eax
     mov [dealer_ace_count], eax
 
-    ; Bakiye stringe çevir → int_to_ascii kullan
+    ; Bakiye stringe çevir, int_to_ascii kullan
     mov eax, [money]
     lea edi, [money_str + 11]
     call int_to_ascii
@@ -857,7 +857,7 @@ player_turn:
 
     ; --- 2a) branch: dealer busted ---
 .dealer_busted:
-    ; dealer patladı, player patlamamıştı (player patlaması zaten elenmişti)
+    ; dealer patladı, player patlamamıştı (player patlasa zaten elenmişti)
     mov al, [player_natural]
     cmp al, 1
     jne .dealer_busted_no_nat
@@ -963,7 +963,7 @@ ask_replay:
     cmp al, 'n'
     je .ask_no
 
-    ; invalid -> mesaj ve tekrar sor
+    ; invalid -> hata mesajı ve tekrar sor
     lea eax, [invalid_action_msg]
     call print_cstr
     jmp .ask_loop
@@ -994,7 +994,7 @@ player_hit:
     mov byte [ebx], al
     ; increment player_card_count
     inc dword [player_card_count]
-    ; if Ace (11) then inc player_ace_count
+    ; if Ace (11) then increase player_ace_count
     cmp al, 11
     jne .ph_noace
     inc dword [player_ace_count]
@@ -1023,7 +1023,7 @@ dealer_hit:
     ret
 
 ; ---------------------------
-; dealer_turn: reveal and draw until >=17 (soft rules: ace handling via calculate_score)
+; dealer_turn: reveal and draw until >=17
 ; ---------------------------
 dealer_turn:
     pushad
@@ -1039,7 +1039,7 @@ dealer_turn:
     call calculate_score    ; EAX = dealer score
     cmp eax, 17
     jb .dealer_do_hit
-    ; if 17 or more, stop (note: this treats 17 as stand; if you want soft 17 hit, change)
+    ; if 17 or more, stop
     jmp .dealer_done
 
 .dealer_do_hit:
@@ -1111,7 +1111,7 @@ player_push:
     jmp show_result
 
 show_result:
-    ; money → ASCII (money_str) dönüşümü
+    ; money to ASCII (money_str) dönüşümü
     mov eax, [money]
     lea edi, [money_str + 11]
     call int_to_ascii
@@ -1141,14 +1141,14 @@ show_result:
     mov edx, 1
     int 0x80
 
-    ; money güncellendikten sonra: para 0 mı kontrol et
+    ; money güncellendikten sonra para 0 mı kontrol et
     cmp dword [money], 0
     jne .ask_replay_label   ; para > 0 ise yeniden oynama sorusuna git
 
     ; para 0 ise oyun bitti mesajı göster ve çık
     lea eax, [game_over_msg]
     call print_cstr
-    je .do_exit             ; veya senin exit etiketin neyse ona git
+    je .do_exit             ; exite git
 
 .ask_replay_label:
     ; ask replay
