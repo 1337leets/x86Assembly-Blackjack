@@ -15,10 +15,11 @@ A fully functional Blackjack game written in bare-metal x86 Assembly (NASM) for 
 
 - **Complete Blackjack rules** — Hit, Stand, Natural Blackjack (3:2 payout), Six-Card Charlie, Push
 - **Ace soft/hard handling** — displayed as `(1/11)` during play, automatically resolved on bust
-- **Dealer AI** — stands on hard 17+, draws on soft 17 (standard casino rules)
+- **Dealer rules** — draws below 17 and stands on every 17, soft 17 included
 - **Bet validation** — rejects invalid input, zero bets, and bets exceeding current balance with overflow protection
 - **Balance tracking** — starts at $100, persists across rounds until game over
 - **Replay loop** — ask to play again after each round; exits cleanly when balance hits $0
+- **Line-based input** — an over-long answer is read as one answer and the rest of the line is dropped, and end of input quits the game
 - **Zero dependencies** — no libc, no external libraries; linked directly as a static ELF32 binary
 
 ---
@@ -54,9 +55,10 @@ Uppercase inputs (`H`, `S`, `Y`, `N`) are accepted as well.
 ## Game Rules
 
 - **Natural Blackjack** — 21 with exactly 2 cards pays **3:2**
-- **Six-Card Charlie** — reaching 21 or under with 6 cards is an automatic win
+- **Six-Card Charlie** — six cards without busting ends your turn and wins, unless the dealer has a natural or six cards as well (then the scores decide)
 - **Push** — tie goes to neither player; bet is returned
-- **Dealer Natural** — beats all non-natural player hands regardless of score
+- **Dealer Natural** — beats all non-natural player hands regardless of score. The hole card stays hidden until you finish your turn, so you only find out when the dealer reveals it
+- **Player Natural** — settled right after the deal, pays 3:2, or is a push if the dealer has one too
 - Dealer must draw below 17, stand on 17 and above
 
 ---
@@ -65,10 +67,11 @@ Uppercase inputs (`H`, `S`, `Y`, `N`) are accepted as well.
 
 Written entirely in x86 NASM assembly targeting the Linux i386 syscall ABI (`int 0x80`).
 
-- **No stack frames** — function calls use `pushad`/`popad` convention throughout
-- **Integer arithmetic only** — 3:2 natural payout computed as `floor(3*bet/2)` via integer ops
+- **Buffered output** — each screen update is collected in a buffer and written with one `sys_write`
+- **Register discipline** — functions save only the registers they change, string lengths are assembler constants
+- **Integer arithmetic only** — 3:2 natural payout computed as `bet + bet/2`, which equals `floor(3*bet/2)` without overflowing
 - **Overflow-safe bet parsing** — input validated digit-by-digit against `money / 10` and `money % 10` to prevent integer overflow without any 64-bit arithmetic
-- **Randomness via RDTSC** — cards drawn using the timestamp counter modulo 52 with collision retry; deterministic but sufficient for a terminal game
+- **Card draw** — `rdtsc` seeds a linear congruential generator once per game, and an already drawn card is replaced by the next free one, so every draw finishes within 52 steps
 - **Ace adjustment loop** — `calculate_score` reduces aces from 11 to 1 iteratively until score ≤ 21 or no aces remain
 
 ---

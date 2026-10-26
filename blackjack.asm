@@ -1,1168 +1,927 @@
+; ================================================================
+; blackjack.asm  -  BlackJack for 32-bit x86 Linux (NASM)
+; ================================================================
+; Build:
+;   nasm -f elf32 blackjack.asm -o blackjack.o
+;   ld -m elf_i386 blackjack.o -o blackjack
+;
+; No libc. All I/O goes through int 0x80 system calls.
+;
+; Notes on the implementation:
+;  - Output is collected in obuf and written with a single sys_write
+;    per screen update instead of one call per character.
+;  - String lengths are assembler constants, so nothing scans for NUL.
+;  - Cards come from an LCG seeded once with rdtsc. If the drawn card
+;    is already used, the next free card is taken, so a draw always
+;    finishes within deck_size steps.
+;  - Functions save only the registers they change instead of pushad.
+; ================================================================
+
 section .data
-    welcome_msg db "Welcome to a game of BlackJack!", 0Ah, 0   ; Hoş geldiniz mesajı
-    welcome_msg_len equ $ - welcome_msg                         ; Mesajın uzunluğu
-    money_msg db "Your balance: ", 0                             ; Bakiye mesajı
-    money_msg_len equ $ - money_msg                               ; Mesajın uzunluğu
-    bet_msg db "Enter your bet amount: ", 0                        ; Bahis mesajı
-    bet_msg_len equ $ - bet_msg                                     ; Mesajın uzunluğu
-    newline db 0Ah, 0                                                   ; Newline
-	deck_values db 2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6
-             db 7,7,7,7,8,8,8,8,9,9,9,9,10,10,10,10
-             db 10,10,10,10,10,10,10,10,10,10,10,10
-             db 11,11,11,11
-	deck_size equ 52
-	dealer_hand_msg db "Dealer's Hand: ",0
-	dealer_hand_msg_len equ $ - dealer_hand_msg
 
-	player_hand_msg db "Your Hand: ",0
-	player_hand_msg_len equ $ - player_hand_msg
+welcome_msg         db  "Welcome to a game of BlackJack!", 0Ah
+welcome_msg_len     equ $ - welcome_msg
 
-	hit_msg db "Hit (h) or Stand (s)? ",0
-	hit_msg_len equ $ - hit_msg
+money_msg           db  "Your balance: "
+money_msg_len       equ $ - money_msg
 
-	replay_msg db "Would you like to play again? (y/n): ",0
-	replay_msg_len equ $ - replay_msg
+bet_msg             db  "Enter your bet amount: "
+bet_msg_len         equ $ - bet_msg
 
-	game_over_msg db "You ran out of balance. You lost the game.",0Ah,0
-	game_over_msg_len equ $ - game_over_msg
+dealer_hand_msg     db  "Dealer's Hand: "
+dealer_hand_msg_len equ $ - dealer_hand_msg
 
-	ending_msg db "Thank you for playing!",0Ah,0
-	ending_msg_len equ $ - ending_msg
+player_hand_msg     db  "Your Hand: "
+player_hand_msg_len equ $ - player_hand_msg
 
-	open_par db " (",0
-	close_par db ")",0
-	qmark db "?",0
-	space_char db " ",0
+hit_msg             db  "Hit (h) or Stand (s)? "
+hit_msg_len         equ $ - hit_msg
 
-	invalid_bet_msg db "Please enter a valid number!",0Ah,0
-	invalid_bet_msg_len equ $ - invalid_bet_msg
+replay_msg          db  "Would you like to play again? (y/n): "
+replay_msg_len      equ $ - replay_msg
 
-	invalid_action_msg db "Please select an option!",0Ah,0
-	invalid_action_msg_len equ $ - invalid_action_msg
+game_over_msg       db  "You ran out of balance. You lost the game.", 0Ah
+game_over_msg_len   equ $ - game_over_msg
 
-	; optional: clear screen ANSI (belki sonrasında eklerim)
-	clear_screen db 0x1B, "[2J", 0x1B, "[H", 0
-	clear_screen_len equ $ - clear_screen
+ending_msg          db  "Thank you for playing!", 0Ah
+ending_msg_len      equ $ - ending_msg
 
+invalid_bet_msg     db  "Please enter a valid number!", 0Ah
+invalid_bet_msg_len equ $ - invalid_bet_msg
+
+invalid_act_msg     db  "Please select an option!", 0Ah
+invalid_act_msg_len equ $ - invalid_act_msg
+
+natural_msg         db  "BlackJack! Natural 21! Pays 3:2.", 0Ah
+natural_msg_len     equ $ - natural_msg
+
+dealer_natural_msg  db  "Dealer has BlackJack! You lose.", 0Ah
+dealer_natural_msg_len equ $ - dealer_natural_msg
+
+push_natural_msg    db  "Both have BlackJack! Push.", 0Ah
+push_natural_msg_len equ $ - push_natural_msg
+
+six_card_msg        db  "Six-Card Charlie! You win.", 0Ah
+six_card_msg_len    equ $ - six_card_msg
+
+dealer_six_msg      db  "Dealer has Six-Card Charlie. You lose.", 0Ah
+dealer_six_msg_len  equ $ - dealer_six_msg
+
+; Standard 52-card deck (2..9 = face value, 10/J/Q/K = 10, A = 11)
+deck_values db  2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6
+            db  7,7,7,7,8,8,8,8,9,9,9,9,10,10,10,10
+            db  10,10,10,10,10,10,10,10,10,10,10,10
+            db  11,11,11,11
+deck_size   equ 52
+
+input_size  equ 16
+
+; ----------------------------------------------------------------
 section .bss
-    input resb 16         ; Kullanıcının bahis miktarını girebileceği alan (16 byte)
-    bet_amount resd 1     ; Kullanıcının bahis miktarını tutacak değişken (dword)
-    money resd 1          ; Kullanıcının parası
-    money_str resb 12     ; int to ascii sonucu tutulacak buffer
-	player_score resd 1
-    dealer_score resd 1
-	deck_used resb 52             ; Kartların kullanılıp kullanılmadığını takip eder
-    card_index resb 1             ; Sıradaki kart için indeks
-    player_cards resb 13          ; Oyuncu kartları
-    dealer_cards resb 13          ; Krupiye kartları
+
+    input             resb input_size  ; one line of user input
+    drain_byte        resb 1     ; scratch byte for dropping the rest of a long line
+    obuf              resb 512   ; output buffer, written with one sys_write
+    obuf_len          resd 1     ; bytes waiting in obuf
+
+    money             resd 1     ; player balance
+    bet_amount        resd 1     ; bet of the current round
+
+    deck_used         resb 52    ; 0 = still in the deck, 1 = drawn
+    rng_state         resd 1     ; LCG state, seeded once from rdtsc
+
+    player_cards      resb 12    ; player card values
+    dealer_cards      resb 12    ; dealer card values
     player_card_count resd 1
     dealer_card_count resd 1
-    player_ace_count resd 1
-    dealer_ace_count resd 1
-	tmp_buf resb 8        ; Geçici yazdırma alanı
-	phase resb 1          ; 0 = dealer partial, 1 = dealer full
-	player_natural    resb 1
-    dealer_natural    resb 1
-    player_six        resb 1
-    dealer_six        resb 1
+    player_ace_count  resd 1     ; number of aces, used to count them as 1
+    dealer_ace_count  resd 1
+    phase             resb 1     ; 0 = dealer hole card hidden, 1 = shown
 
+    num_buf           resb 12    ; scratch space for uint_to_obuf
+
+; ================================================================
 section .text
-    global _start
+global _start
 
-init_deck:
-    mov ecx, deck_size
-    mov edi, deck_used
-    xor eax, eax
-.init_loop:
-    mov byte [edi], 0
-    inc edi
-    loop .init_loop
-
-    ; sıfırla: player_cards (13 byte)
-    mov ecx, 13
-    lea edi, [player_cards]
-    xor al, al
-    rep stosb
-
-    ; sıfırla: dealer_cards (13 byte)
-    mov ecx, 13
-    lea edi, [dealer_cards]
-    xor al, al
-    rep stosb
-
-    mov byte [card_index], 0
+; ----------------------------------------------------------------
+; obuf_flush - write obuf to stdout and empty it
+; Modifies: EAX, EBX, ECX, EDX
+; ----------------------------------------------------------------
+obuf_flush:
+    mov edx, [obuf_len]
+    test edx, edx
+    jz .empty
+    mov eax, 4
+    mov ebx, 1
+    lea ecx, [obuf]
+    int 0x80
+    mov dword [obuf_len], 0
+.empty:
     ret
 
-int_to_ascii:
-    ; Girdi: eax = sayı, edi = hedef buffer sonundan 1 önce
-    mov byte [edi], 0
-    dec edi
+; ----------------------------------------------------------------
+; obuf_write_raw - ECX = ptr, EDX = len, append len bytes to obuf
+; Preserves all registers
+; ----------------------------------------------------------------
+obuf_write_raw:
+    push esi
+    push edi
+    push ecx
+    push edx
+    mov esi, ecx                    ; source = ptr
+    mov edi, [obuf_len]
+    lea edi, [obuf + edi]           ; destination = obuf + current length
+    mov ecx, edx                    ; count = len
+    rep movsb
+    pop edx                         ; EDX = original len
+    pop ecx
+    add [obuf_len], edx
+    pop edi
+    pop esi
+    ret
+
+; ----------------------------------------------------------------
+; obuf_write_char - append the byte in AL to obuf
+; Preserves all registers
+; ----------------------------------------------------------------
+obuf_write_char:
+    push edi
+    mov edi, [obuf_len]
+    mov [obuf + edi], al
+    inc dword [obuf_len]
+    pop edi
+    ret
+
+; ----------------------------------------------------------------
+; obuf_write_card - AL = card value (2..11), append '2'..'9', '10' or 'A'
+; Modifies: AL
+; ----------------------------------------------------------------
+obuf_write_card:
+    push edi
+    mov edi, [obuf_len]
+    cmp al, 11
+    je .ace
+    cmp al, 10
+    je .ten
+    add al, '0'                     ; 2..9 is a single character
+    mov [obuf + edi], al
+    inc edi
+    jmp .done
+.ten:
+    ; little-endian word 0x3031 stores '1' then '0'
+    mov word [obuf + edi], 0x3031
+    add edi, 2
+    jmp .done
+.ace:
+    mov byte [obuf + edi], 'A'
+    inc edi
+.done:
+    mov [obuf_len], edi
+    pop edi
+    ret
+
+; ----------------------------------------------------------------
+; uint_to_obuf - EAX = unsigned integer, append its decimal digits to obuf
+; Modifies: EAX, ECX, EDX
+; ----------------------------------------------------------------
+uint_to_obuf:
+    push ebx
+    lea ebx, [num_buf + 11]         ; fill the buffer from the end
     mov ecx, 10
-.int_to_ascii_loop:
+.digit:
+    dec ebx
     xor edx, edx
-    div ecx
+    div ecx                         ; EAX = quotient, EDX = remainder
     add dl, '0'
-    mov [edi], dl
-    dec edi
+    mov [ebx], dl
     test eax, eax
-    jnz .int_to_ascii_loop
-    inc edi
+    jnz .digit
+    ; EBX = first digit
+    lea eax, [num_buf + 11]
+    sub eax, ebx                    ; EAX = number of digits
+    mov edx, eax
+    mov ecx, ebx
+    call obuf_write_raw
+    pop ebx
     ret
 
-ascii_to_int:
-    ; Girdi: esi = string başlangıcı, eax = 0 dönecek sayı
+; ----------------------------------------------------------------
+; low_high_to_obuf - ESI = cards, ECX = count
+; Writes the score as "low", or as "low/high" while an ace can still count as 11
+; Modifies: EAX, EBX, ECX, EDX
+; ----------------------------------------------------------------
+low_high_to_obuf:
+    push ebp
+    push esi
+    ; raw sum with every ace as 11, and the number of aces
+    xor eax, eax                    ; raw sum
+    xor ebx, ebx                    ; card index
+    xor edx, edx                    ; ace count
+.sum:
+    cmp ebx, ecx
+    jge .compute
+    movzx ebp, byte [esi + ebx]
+    add eax, ebp
+    cmp ebp, 11
+    jne .next
+    inc edx
+.next:
+    inc ebx
+    jmp .sum
+
+.compute:
+    ; low = raw sum - 10 * aces, every ace counted as 1
+    push edx
+    mov ecx, edx
+    imul ecx, 10
+    sub eax, ecx                    ; EAX = low score
+    pop edx
+
+    test edx, edx
+    jz .only_low                    ; no aces, only one score
+
+    mov ecx, eax
+    add ecx, 10                     ; ECX = high, one ace counted as 11
+    cmp ecx, 21
+    jg .only_low                    ; high would bust, show only low
+
+    push ecx
+    call uint_to_obuf               ; low
+    mov al, '/'
+    call obuf_write_char
+    pop eax
+    call uint_to_obuf               ; high
+    jmp .lh_done
+
+.only_low:
+    call uint_to_obuf
+
+.lh_done:
+    pop esi
+    pop ebp
+    ret
+
+; ----------------------------------------------------------------
+; calculate_score - ESI = cards, ECX = count, EDX = ace count, returns EAX = score
+; While the total is over 21, one ace at a time is counted as 1 instead of 11
+; Modifies: EAX, EBX, EDX
+; ----------------------------------------------------------------
+calculate_score:
+    push ebp
     xor eax, eax
     xor ebx, ebx
-.ascii_loop:
-    movzx ecx, byte [esi + ebx]
-    cmp ecx, 0
-    je .done
-    cmp ecx, 10
-    je .done
-    cmp ecx, '0'
-    jl .done
-    cmp ecx, '9'
-    jg .done
-    sub ecx, '0'
-    imul eax, eax, 10
-    add eax, ecx
+.sum:
+    cmp ebx, ecx
+    jge .reduce
+    movzx ebp, byte [esi + ebx]
+    add eax, ebp
     inc ebx
-    jmp .ascii_loop
+    jmp .sum
+.reduce:
+    cmp eax, 21
+    jle .done
+    test edx, edx
+    jz .done
+    sub eax, 10
+    dec edx
+    jmp .reduce
 .done:
+    pop ebp
     ret
 
-draw_card:
-    rdtsc                   ; EDX:EAX = time‐stamp counter
-    ; sadece EAX’in alt yarısını kullanılacak:
-    xor edx, edx            ; EDX = 0
-    mov ecx, deck_size      ; bölen = 52
-    div ecx                 ; EAX = quotient, EDX = remainder (0..51)
-    mov ebx, edx            ; EBX = kart indeksi
+; ----------------------------------------------------------------
+; print_hand_state - write both hands to obuf and flush
+; phase 0 shows the first dealer card and "?", phase 1 shows the whole hand
+; Modifies: EAX, EBX, ECX, EDX, ESI
+; ----------------------------------------------------------------
+print_hand_state:
+    ; dealer line
+    lea ecx, [dealer_hand_msg]
+    mov edx, dealer_hand_msg_len
+    call obuf_write_raw
 
-    ; eğer kart kullanıldıysa yeniden dene
-    mov al, [deck_used + ebx]
-    cmp al, 1
-    je draw_card            ; recursive retry (ya da .retry etiketi)
-    ; kartı işaretle ve değeri döndür
+    movzx eax, byte [dealer_cards]  ; the first card is always visible
+    call obuf_write_card
+    mov al, ' '
+    call obuf_write_char
+
+    cmp byte [phase], 0
+    jne .dealer_full
+
+    ; hole card hidden
+    mov al, '?'
+    call obuf_write_char
+    mov al, ' '
+    call obuf_write_char
+    jmp .dealer_paren
+
+.dealer_full:
+    mov ebx, 1
+    mov ecx, [dealer_card_count]
+.dealer_loop:
+    cmp ebx, ecx
+    jge .dealer_paren
+    movzx eax, byte [dealer_cards + ebx]
+    call obuf_write_card
+    mov al, ' '
+    call obuf_write_char
+    inc ebx
+    jmp .dealer_loop
+
+.dealer_paren:
+    mov al, '('
+    call obuf_write_char
+    lea esi, [dealer_cards]
+    cmp byte [phase], 0
+    jne .dp_full
+    mov ecx, 1                      ; hidden hole card, score of the first card only
+    jmp .dp_call
+.dp_full:
+    mov ecx, [dealer_card_count]
+.dp_call:
+    call low_high_to_obuf
+    mov al, ')'
+    call obuf_write_char
+    mov al, 0Ah
+    call obuf_write_char
+
+    ; player line
+    lea ecx, [player_hand_msg]
+    mov edx, player_hand_msg_len
+    call obuf_write_raw
+
+    xor ebx, ebx
+    mov ecx, [player_card_count]
+.player_loop:
+    cmp ebx, ecx
+    jge .player_paren
+    movzx eax, byte [player_cards + ebx]
+    call obuf_write_card
+    mov al, ' '
+    call obuf_write_char
+    inc ebx
+    jmp .player_loop
+
+.player_paren:
+    mov al, '('
+    call obuf_write_char
+    lea esi, [player_cards]
+    mov ecx, [player_card_count]
+    call low_high_to_obuf
+    mov al, ')'
+    call obuf_write_char
+    mov al, 0Ah
+    call obuf_write_char
+
+    call obuf_flush
+    ret
+
+; ----------------------------------------------------------------
+; init_deck - clear deck_used and both card buffers
+; Modifies: EAX, ECX, EDI
+; ----------------------------------------------------------------
+init_deck:
+    xor eax, eax
+    lea edi, [deck_used]
+    mov ecx, deck_size
+    rep stosb
+
+    lea edi, [player_cards]
+    mov ecx, 12
+    rep stosb
+
+    lea edi, [dealer_cards]
+    mov ecx, 12
+    rep stosb
+    ret
+
+; ----------------------------------------------------------------
+; draw_card - returns EAX = value (2..11) of a card not drawn yet this round
+; LCG step with the Numerical Recipes constants, then a linear probe over
+; deck_used, so at most deck_size slots are checked
+; Modifies: EAX, EBX, ECX, EDX
+; ----------------------------------------------------------------
+draw_card:
+    ; state = state * 1664525 + 1013904223  (mod 2^32)
+    mov eax, [rng_state]
+    imul eax, 1664525
+    add eax, 1013904223
+    mov [rng_state], eax
+    xor edx, edx
+    mov ecx, deck_size
+    div ecx                         ; EDX = starting index 0..51
+    mov ebx, edx
+    mov ecx, deck_size              ; slots left to check
+.probe:
+    cmp byte [deck_used + ebx], 0
+    je .found
+    inc ebx
+    cmp ebx, deck_size
+    jb .no_wrap
+    xor ebx, ebx
+.no_wrap:
+    dec ecx
+    jnz .probe
+    xor eax, eax                    ; deck empty, cannot happen with 24 card slots
+    ret
+.found:
     mov byte [deck_used + ebx], 1
     movzx eax, byte [deck_values + ebx]
     ret
 
-calculate_score:
-    xor eax, eax          ; toplam = 0
-    xor ebx, ebx          ; index = 0
-    push edx              ; ace count'ı yedekle
-
-.sum_cards:
-    cmp ebx, ecx
-    jge .chk_aces
-    movzx edi, byte [esi + ebx]   ; kart değeri edi'ye
-    add eax, edi             ; toplam += kart
-    inc ebx
-    jmp .sum_cards
-
-.chk_aces:
-    pop edx                  ; ace_count'ı geri al
-
-.check_loop:
-    cmp eax, 21
-    jle .done_score
-    cmp edx, 0
-    jle .done_score
-    sub eax, 10              ; bir Ace'i 1 yap
-    dec edx
-    jmp .check_loop
-
-.done_score:
-    ret
-
-; -----------------------------
-; calc_set_player_flags
-; Inputs: ESI=player_cards, ECX=player_card_count, EDX=player_ace_count
-; sets [player_score], [player_natural], [player_six]
-; -----------------------------
-calc_set_player_flags:
-    push ecx
-    push edx
-    call calculate_score        ; EAX = score
-    mov [player_score], eax
-    pop edx
-    pop ecx
-
-    mov ebx, ecx                ; ebx = card_count
-
-    ; NATURAL? (2 kart && score==21)
-    cmp ebx, 2
-    jne .p_nat0
-    cmp eax, 21
-    jne .p_nat0
-    mov byte [player_natural], 1
-    jmp .p_nat_done
-.p_nat0:
-    mov byte [player_natural], 0
-.p_nat_done:
-
-    ; SIX-CARD-CHARLIE? (>=6 kart && score <= 21)
-    cmp ebx, 6
-    jb .p_six0
-    cmp eax, 21
-    ja .p_six0
-    mov byte [player_six], 1
-    jmp .p_six_done
-.p_six0:
-    mov byte [player_six], 0
-.p_six_done:
-    ret
-
-; -----------------------------
-; calc_set_dealer_flags
-; Inputs: ESI=dealer_cards, ECX=dealer_card_count, EDX=dealer_ace_count
-; sets [dealer_score], [dealer_natural], [dealer_six]
-; -----------------------------
-calc_set_dealer_flags:
-    push ecx
-    push edx
-    call calculate_score
-    mov [dealer_score], eax
-    pop edx
-    pop ecx
-
-    mov ebx, ecx
-
-    cmp ebx, 2
-    jne .d_nat0
-    cmp eax, 21
-    jne .d_nat0
-    mov byte [dealer_natural], 1
-    jmp .d_nat_done
-.d_nat0:
-    mov byte [dealer_natural], 0
-.d_nat_done:
-
-    cmp ebx, 6
-    jb .d_six0
-    cmp eax, 21
-    ja .d_six0
-    mov byte [dealer_six], 1
-    jmp .d_six_done
-.d_six0:
-    mov byte [dealer_six], 0
-.d_six_done:
-    ret
-
-; ----------------------------
-; print_low_high_from_cards
-; Inputs: ESI = pointer to cards (bytes), ECX = count
-; Uses: print_number_in_money_str (EAX->print), small_write (DL->print char)
-; Preserves regs via pushad/popad
-; Prints either "low" or "low/high"
-; ----------------------------
-print_low_high_from_cards:
-    pushad
-
-    xor eax, eax        ; raw_sum
-    xor ebx, ebx        ; index
-    xor edx, edx        ; ace_count
-
-.pl_loop:
-    cmp ebx, ecx
-    jge .pl_done
-    movzx edi, byte [esi + ebx]  ; card value
-    add eax, edi
-    cmp edi, 11
-    jne .pl_next
-    inc edx
-.pl_next:
-    inc ebx
-    jmp .pl_loop
-
-.pl_done:
-    ; raw_sum in EAX, ace_count in EDX
-    mov esi, edx        ; tmp = ace_count
-    mov ebx, eax        ; ebx = raw_sum
-
-    ; low = raw_sum - ace_count*10
-    mov eax, ebx
-    mov ecx, esi
-    imul ecx, 10        ; ecx = ace_count*10
-    sub eax, ecx        ; eax = low
-
-    ; if no ace -> print low
-    cmp esi, 0
-    je .print_low
-
-    ; high = low + 10 ; check <= 21
-    mov ecx, eax
-    add ecx, 10
-    cmp ecx, 21
-    jg .print_low
-
-    ; print low
-    mov eax, eax        ; low already in EAX
-    call print_number_in_money_str
-
-    ; print '/'
-    mov dl, '/'
-    call small_write
-
-    ; print high (low + 10)
-    mov eax, eax
-    add eax, 10
-    call print_number_in_money_str
-
-    jmp .pl_finish
-
-.print_low:
-    mov eax, eax
-    call print_number_in_money_str
-
-.pl_finish:
-    popad
-    ret
-
-; ---------- print_cstr (EAX = pointer to NUL-terminated string) ----------
-print_cstr:
-    pushad
-    mov esi, eax
-    xor ecx, ecx
-.pc_len:
-    mov al, [esi + ecx]     ; read byte
-    cmp al, 0
-    je .pc_have_len
-    inc ecx
-    jmp .pc_len
-.pc_have_len:
-    mov eax, 4
-    mov ebx, 1
-    mov edx, ecx
-    mov ecx, esi
-    int 0x80
-    popad
-    ret
-
-; ---------- small_write: write single byte in tmp_buf (DL = char) ----------
-; usage: mov dl, 'X' ; call small_write
-small_write:
-    pushad
-    lea eax, [tmp_buf]
-    mov byte [eax], dl
-    mov byte [eax+1], 0
-    lea eax, [tmp_buf]
-    call print_cstr
-    popad
-    ret
-
-; ---------- print_number_in_money_str: EAX = number; uses money_str buffer ----------
-; (sonuna NUL koyup sys_write ile yazdır)
-print_number_in_money_str:
-    pushad
-    lea edi, [money_str + 11]
-    ; int_to_ascii expects EAX = number, EDI = end pointer
-    ; our int_to_ascii uses: eax = number, edi = end, and returns with edi pointing to start
-    call int_to_ascii
-    ; edi -> start of ASCII, money_str+11 - start = length-1 ...
-    mov eax, money_str
-    add eax, 11
-    sub eax, edi
-    mov edx, eax   ; length
-    mov ecx, edi   ; pointer
-    mov eax, 4
-    mov ebx, 1
-    int 0x80
-    popad
-    ret
-
-; ---------- print_hand_state: prints Dealer's and Player's hands ----------
-; uses byte [input] as phase: 0 = dealer partial (show first card + '?'), 1 = full dealer
-print_hand_state:
-    pushad
-    mov bl, byte [phase]        ; phase
-
-    ; print "Dealer's Hand: "
-    lea eax, [dealer_hand_msg]
-    call print_cstr
-
-    ; --- print first dealer card ---
-    movzx ecx, byte [dealer_cards]               ; cl = value
-    cmp cl, 11
-    je .dealer_first_A
-    cmp cl, 10
-    je .dealer_first_10
-    ; digit 2..9
-    add cl, '0'
-    mov dl, cl
-    call small_write
-    jmp .dealer_after_first
-
-.dealer_first_10:
-    mov dl, '1'
-    call small_write
-    ; write '0' separately (small_write writes one char; we want "10" here)
-    mov dl, '0'
-    call small_write
-    jmp .dealer_after_first
-
-.dealer_first_A:
-    mov dl, 'A'
-    call small_write
-
-.dealer_after_first:
-    ; print space
-    mov dl, ' '
-    call small_write
-
-    ; if partial -> print '?'
-    cmp bl, 0
-    je .dealer_print_qmark
-
-    ; else print remaining dealer cards
-    mov esi, 1
-    mov ecx, [dealer_card_count]
-.dealer_loop:
-    cmp esi, ecx
-    jge .dealer_paren
-    movzx edx, byte [dealer_cards + esi]
-    cmp dl, 11
-    je .dealer_mid_A
-    cmp dl, 10
-    je .dealer_mid_10
-    add dl, '0'
-    call small_write
-    jmp .dealer_mid_after
-
-.dealer_mid_10:
-    mov dl, '1'
-    call small_write
-    mov dl, '0'
-    call small_write
-    jmp .dealer_mid_after
-
-.dealer_mid_A:
-    mov dl, 'A'
-    call small_write
-
-.dealer_mid_after:
-    mov dl, ' '
-    call small_write
-    inc esi
-    jmp .dealer_loop
-
-.dealer_print_qmark:
-    mov dl, '?'
-    call small_write
-    mov dl, ' '
-    call small_write
-    jmp .dealer_paren
-
-.dealer_paren:
-    ; print " ("
-    lea eax, [open_par]
-    call print_cstr
-
-    cmp bl, 0
-	je .dealer_partial_compute
-
-    ; full: compute dealer score and print
-    lea esi, [dealer_cards]
-    mov ecx, [dealer_card_count]
-	call print_low_high_from_cards
-    jmp .dealer_close_paren
-
-.dealer_partial_compute:
-	lea esi, [dealer_cards]
-	mov ecx, 1
-	call print_low_high_from_cards
-	jmp .dealer_close_paren
-
-.dealer_close_paren:
-    lea eax, [close_par]
-    call print_cstr
-    lea eax, [newline]
-    call print_cstr
-
-    ; --- Player line ---
-    lea eax, [player_hand_msg]
-    call print_cstr
-
-    mov esi, 0
-    mov ecx, [player_card_count]
-.ploop:
-    cmp esi, ecx
-    jge .player_paren
-    movzx edx, byte [player_cards + esi]
-    cmp dl, 11
-    je .player_A
-    cmp dl, 10
-    je .player_10
-    add dl, '0'
-    mov dl, dl
-    call small_write
-    jmp .player_after_print
-
-.player_10:
-    mov dl, '1'
-    call small_write
-    mov dl, '0'
-    call small_write
-    jmp .player_after_print
-
-.player_A:
-    mov dl, 'A'
-    call small_write
-
-.player_after_print:
-    mov dl, ' '
-    call small_write
-    inc esi
-    jmp .ploop
-
-.player_paren:
-    ; print " ("
-    lea eax, [open_par]
-    call print_cstr
-
-    ; compute player score and print
-    lea esi, [player_cards]
-    mov ecx, [player_card_count]
-	call print_low_high_from_cards
-
-    ; print ")"
-    lea eax, [close_par]
-    call print_cstr
-    lea eax, [newline]
-    call print_cstr
-
-    popad
-    ret
-
-_start:
-    mov dword [money], 100     ; Oyuncunun parası
-	jmp start_round
-
-start_round:
-    call init_deck             ; Deste hazırla
-
-	mov byte [phase], 0
-
-	mov byte [player_natural], 0
-    mov byte [dealer_natural], 0
-    mov byte [player_six], 0
-    mov byte [dealer_six], 0
-
-    ; Kart sayacı / ace sayacı sıfırla
-    xor eax, eax
-    mov [player_card_count], eax
-    mov [dealer_card_count], eax
-    mov [player_ace_count], eax
-    mov [dealer_ace_count], eax
-
-    ; Bakiye stringe çevir, int_to_ascii kullan
-    mov eax, [money]
-    lea edi, [money_str + 11]
-    call int_to_ascii
-
-    ; 1. Hoş geldiniz mesajını yazdır
-    mov eax, 4          ; sys_write
-    mov ebx, 1          ; stdout
-    lea ecx, [welcome_msg]  ; mesajın adresi
-    mov edx, welcome_msg_len  ; mesajın uzunluğu
-    int 0x80            ; sistem çağrısını yap
-
-    ; 2. Para mesajını yazdır
-    mov eax, 4          ; sys_write
-    mov ebx, 1          ; stdout
-    lea ecx, [money_msg]  ; mesajın adresi
-    mov edx, money_msg_len  ; mesajın uzunluğu
-    int 0x80
-
-    ; 3. Para miktarını yazdır
-    mov eax, 4
-    mov ebx, 1
-    mov ecx, edi
-
-    mov eax, money_str
-    add eax, 11      ; money_str + 12 - 1
-    sub eax, edi     ; (money_str + 11) - edi
-    mov edx, eax     ; edx = yazdırılacak karakter sayısı
-
-    mov eax, 4
-    int 0x80
-
-    ; 4. Newline yazdır
-    mov eax, 4
-    mov ebx, 1
-    lea ecx, [newline]
-    mov edx, 1
-    int 0x80
-
-; -----------------------------------------
-; GET_BET_LOOP
-; -----------------------------------------
-get_bet_loop:
-    ; (opsiyonel) ekranı temizle
-    ; lea eax, [clear_screen]
-    ; call print_cstr
-
-    ; prompt
-    lea eax, [bet_msg]
-    call print_cstr
-
-    ; read input
-    mov eax, 3
-    mov ebx, 0
-    lea ecx, [input]
-    mov edx, 16
-    int 0x80
-
-    ; nothing read -> retry
-    test eax, eax
-    jz .bad_bet_input
-
-    ; sanitize newline -> replace first newline or NUL with 0
-    mov esi, input
-    mov ecx, eax            ; bytes read
-.sanitize_loop2:
-    mov al, [esi]
-    cmp al, 0x0A
-    je .found_nl2
-    cmp al, 0
-    je .found_nl2
-    inc esi
-    dec ecx
-    jnz .sanitize_loop2
-.found_nl2:
-    mov byte [esi], 0
-
-    ; validate characters: must be at least 1 digit, all '0'..'9'
-    mov esi, input
-    xor edi, edi            ; digit_count = 0
-.validate_chars2:
-    mov al, [esi]
-    cmp al, 0
-    je .validate_done2
-    cmp al, '0'
-    jb .bad_bet_input
-    cmp al, '9'
-    ja .bad_bet_input
-    inc edi
-    inc esi
-    jmp .validate_chars2
-.validate_done2:
-    cmp edi, 1
-    jl .bad_bet_input
-
-    ; ---------- SAFE PARSE with clear registers ----------
-    pushad
-
-    ; prepare limits: EBX = money, ECX = money_div10, EDI = money_mod
-    mov ebx, [money]        ; EBX = money
-    mov eax, ebx
-    xor edx, edx
-    mov ecx, 10
-    div ecx                 ; EAX = money_div10, EDX = money_mod
-    mov ecx, eax            ; ECX = money_div10
-    mov edi, edx            ; EDI = money_mod
-
-    ; parse digits into EAX
-    xor eax, eax            ; parsed = 0
-    lea esi, [input]
-
-.safe_parse2:
-    mov dl, [esi]           ; char -> DL (EAX korunur)
-    cmp dl, 0
-    je .safe_done2
-    sub dl, '0'             ; dl = digit (0..9)
-    movzx edx, dl           ; edx = digit (zero-extended)
-
-    ; check overflow condition:
-    ; if parsed > money_div10 -> overflow
-    cmp eax, ecx
-    ja .parse_overflow2
-    ; if parsed == money_div10 and digit > money_mod -> overflow
-    cmp eax, ecx
-    jne .safe_update2
-    cmp edx, edi
-    ja .parse_overflow2
-
-.safe_update2:
-    ; parsed = parsed*10 + digit
-    imul eax, eax, 10       ; eax *= 10
-    add eax, edx
-    inc esi
-    jmp .safe_parse2
-
-.safe_done2:
-    ; reject zero
-    cmp eax, 0
-    jle .parse_overflow2
-
-    mov [bet_amount], eax
-    popad
-    jmp .bet_ok2
-
-.parse_overflow2:
-    popad
-    lea eax, [invalid_bet_msg]
-    call print_cstr
-    jmp get_bet_loop
-
-.bad_bet_input:
-    lea eax, [invalid_bet_msg]
-    call print_cstr
-    jmp get_bet_loop
-
-.bet_ok2:
-    call draw_card
-    mov byte [player_cards + 0], al
-    cmp al, 11
-    jne .skip1
-    inc dword [player_ace_count]
-.skip1:
-    call draw_card
-    mov byte [player_cards + 1], al
-    cmp al, 11
-    jne .skip2
-    inc dword [player_ace_count]
-.skip2:
-    mov dword [player_card_count], 2
-
-    ; Krupiyeye 2 kart
-    call draw_card
-    mov byte [dealer_cards + 0], al
-    cmp al, 11
-    jne .skip3
-    inc dword [dealer_ace_count]
-.skip3:
-    call draw_card
-    mov byte [dealer_cards + 1], al
-    cmp al, 11
-    jne .skip4
-    inc dword [dealer_ace_count]
-.skip4:
-    mov dword [dealer_card_count], 2
-
-    ; hesaplama zaten var — sonra player turn
-    jmp player_turn
-
-player_turn:
-    ; player turn loop
-.player_turn_loop:
-    ; show hand
-    call print_hand_state
-
-    ; get h/s
-    call get_hit_or_stand_loop
-    ; returned char in AL (lowercase)
-    cmp al, 'h'
-    je .player_do_hit
-    cmp al, 's'
-    je .player_done
-
-.player_do_hit:
-    call player_hit
-    ; after hit, compute player score
-    lea esi, [player_cards]
-    mov ecx, [player_card_count]
-    mov edx, [player_ace_count]
-    call calculate_score
-    cmp eax, 21
-    jg .player_bust  ; >21 -> lost
-    ; else continue loop
-    jmp .player_turn_loop
-
-.player_bust:
-    mov byte [phase], 1
-	call print_hand_state
-    jmp player_lost   ; label exists already
-
-.player_done:
-    ; player stands -> dealer turn
-    call dealer_turn
-
-    ; hesaplamaları ve flag'leri al (calc_set_* fonksiyonları score+flags ayarlamalı)
-    lea esi, [player_cards]
-    mov ecx, [player_card_count]
-    mov edx, [player_ace_count]
-    call calc_set_player_flags    ; doldurur: [player_score], [player_natural], [player_six]
-
-    lea esi, [dealer_cards]
-    mov ecx, [dealer_card_count]
-    mov edx, [dealer_ace_count]
-    call calc_set_dealer_flags    ; doldurur: [dealer_score], [dealer_natural], [dealer_six]
-
-    ; --- 1) Player bust? (safety) ---
-    mov eax, [player_score]
-    cmp eax, 21
-    jg player_lost        ; player zaten patlamışsa kaybet
-
-    ; --- 2) Dealer busted? özel durum: player natural önceliği ---
-    mov ebx, [dealer_score]
-    cmp ebx, 21
-    ja .dealer_busted
-
-    ; --- 3) Neither busted: NATURAL kontrolü ---
-    mov al, [player_natural]
-    mov bl, [dealer_natural]
-    cmp al, bl
-    jne .nat_diff
-    cmp al, 1
-    je player_push         ; her ikisi de natural -> push
-    jmp .check_six         ; ikisi de değil -> six-card kontrolüne geç
-
-.nat_diff:
-    cmp al, 1
-    je .player_nat_only
-    cmp bl, 1
-    je .dealer_nat_only
-
-.player_nat_only:
-    call player_natural_win
-    jmp show_result
-
-.dealer_nat_only:
-    jmp player_lost
-
-    ; --- 4) Six-card-charlie kontrolü ---
-.check_six:
-    mov al, [player_six]
-    mov bl, [dealer_six]
-    cmp al, bl
-    jne .six_diff
-    cmp al, 1
-    je .both_six_compare   ; her ikisi de six-card ise puana bak
-    ; ikisi de değil -> normal karşılaştır
-    jmp .normal_compare
-
-.six_diff:
-    cmp al, 1
-    je player_won
-    jmp player_lost
-
-.both_six_compare:
-    mov eax, [player_score]
-    mov ebx, [dealer_score]
-    cmp eax, ebx
-    ja player_won
-    jb player_lost
-    jmp player_push
-
-    ; --- 5) Normal skor karşılaştırması ---
-.normal_compare:
-    mov eax, [player_score]
-    mov ebx, [dealer_score]
-    cmp eax, ebx
-    ja player_won
-    jb player_lost
-    jmp player_push
-
-    ; --- 2a) branch: dealer busted ---
-.dealer_busted:
-    ; dealer patladı, player patlamamıştı (player patlasa zaten elenmişti)
-    mov al, [player_natural]
-    cmp al, 1
-    jne .dealer_busted_no_nat
-
-    ; player natural ise natural payout al
-    call player_natural_win
-    jmp show_result
-
-.dealer_busted_no_nat:
-    ; player natural değil -> normal win
-    jmp player_won
-; -----------------------------------------
-
-	mov byte [phase], 0    ; phase = 0 (dealer partial)
-
-; ---------------------------
-; get_hit_or_stand_loop
-; - döngüyle 'h' veya 's' okur (küçük harf veya büyük harf kabul)
-; - return: AL = 'h' veya 's' (ascii)
-; ---------------------------
-get_hit_or_stand_loop:
-    pushad
-.read_loop:
-    ; prompt
-    lea eax, [hit_msg]
-    call print_cstr
-
-    ; read 2 byte (char + newline)
-    mov eax, 3
-    mov ebx, 0
-    lea ecx, [input]
-    mov edx, 4
-    int 0x80
-    test eax, eax
-    jz .read_loop
-
-    ; sanitize: first char in [input]
-    mov al, [input]
-    cmp al, 0
-    je .read_loop
-
-    ; normalize to lowercase if uppercase A-Z
-    cmp al, 'A'
-    jb .chk_char_a
-    cmp al, 'Z'
-    ja .chk_char_a
-    add al, 32  ; make lowercase
-
-.chk_char_a:
-    cmp al, 'h'
-    je .got_h
-    cmp al, 's'
-    je .got_s
-    ; invalid -> loop
-    lea eax, [invalid_action_msg] ; invalid action message
-    call print_cstr
-    jmp .read_loop
-
-.got_h:
-    mov byte [tmp_buf], al   ; seçimi belleğe kaydet (tmp_buf zaten bss'de var)
-    popad
-    mov al, [tmp_buf]       ; bellekteki sonucu geri al
-    ret
-
-.got_s:
-    mov byte [tmp_buf], al
-    popad
-    mov al, [tmp_buf]
-    ret
-
-; ask_replay: prompt replay_msg, read input, normalize to lowercase, accept 'y' or 'n'
-; returns: tmp_buf[0] = 'y' or 'n'
-ask_replay:
-    pushad
-.ask_loop:
-    lea eax, [replay_msg]
-    call print_cstr
-
-    ; read up to 4 bytes (char + newline); reuse input buffer
-    mov eax, 3
-    mov ebx, 0
-    lea ecx, [input]
-    mov edx, 4
-    int 0x80
-    test eax, eax
-    jz .ask_loop
-
-    ; take first byte
-    mov al, [input]
-    cmp al, 0
-    je .ask_loop
-
-    ; normalize uppercase A-Z -> a-z
-    cmp al, 'A'
-    jb .ask_chk
-    cmp al, 'Z'
-    ja .ask_chk
-    add al, 32
-
-.ask_chk:
-    cmp al, 'y'
-    je .ask_yes
-    cmp al, 'n'
-    je .ask_no
-
-    ; invalid -> hata mesajı ve tekrar sor
-    lea eax, [invalid_action_msg]
-    call print_cstr
-    jmp .ask_loop
-
-.ask_yes:
-    mov byte [tmp_buf], 'y'
-    popad
-    ret
-
-.ask_no:
-    mov byte [tmp_buf], 'n'
-    popad
-    ret
-
-; ---------------------------
-; player_hit: draw card for player, update counts and ace count
-; uses AL = card value returned by draw_card
-; ---------------------------
+; ----------------------------------------------------------------
+; player_hit - draw a card for the player and update the counters
+; Returns: AL = card value
+; Modifies: EAX, EBX, ECX, EDX
+; ----------------------------------------------------------------
 player_hit:
-    pushad
-    call draw_card           ; AL = card (8-bit)
-    movzx eax, al            ; EAX = card value
-    ; store into player_cards[ player_card_count ]
+    call draw_card
     mov ecx, [player_card_count]
-    mov edx, ecx
-    mov ebx, player_cards
-    add ebx, edx
-    mov byte [ebx], al
-    ; increment player_card_count
+    mov [player_cards + ecx], al
     inc dword [player_card_count]
-    ; if Ace (11) then increase player_ace_count
     cmp al, 11
-    jne .ph_noace
+    jne .done
     inc dword [player_ace_count]
-.ph_noace:
-    popad
+.done:
     ret
 
-; ---------------------------
-; dealer_hit: draw card for dealer, update counts and ace count
-; ---------------------------
+; ----------------------------------------------------------------
+; dealer_hit - draw a card for the dealer and update the counters
+; Returns: AL = card value
+; Modifies: EAX, EBX, ECX, EDX
+; ----------------------------------------------------------------
 dealer_hit:
-    pushad
     call draw_card
-    movzx eax, al
     mov ecx, [dealer_card_count]
-    mov edx, ecx
-    mov ebx, dealer_cards
-    add ebx, edx
-    mov byte [ebx], al
+    mov [dealer_cards + ecx], al
     inc dword [dealer_card_count]
     cmp al, 11
-    jne .dh_noace
+    jne .done
     inc dword [dealer_ace_count]
-.dh_noace:
-    popad
+.done:
     ret
 
-; ---------------------------
-; dealer_turn: reveal and draw until >=17
-; ---------------------------
+; ----------------------------------------------------------------
+; read_line - read one line from stdin into input, NUL-terminated, without the newline
+; The rest of a line longer than the buffer is read and dropped, so it does not
+; answer the next prompt. End of input quits the game.
+; Returns: EAX = length of the line
+; Modifies: EAX, EBX, ECX, EDX
+; ----------------------------------------------------------------
+read_line:
+    mov eax, 3
+    xor ebx, ebx
+    lea ecx, [input]
+    mov edx, input_size - 1         ; keep one byte for the NUL
+    int 0x80
+    test eax, eax
+    jle do_exit                     ; end of input or read error
+
+    xor ecx, ecx
+.scan:
+    cmp ecx, eax
+    jae .no_newline
+    cmp byte [input + ecx], 0Ah
+    je .terminate
+    inc ecx
+    jmp .scan
+
+.no_newline:
+    ; the line did not fit, drop bytes up to and including the newline
+    push ecx
+.drain:
+    mov eax, 3
+    xor ebx, ebx
+    lea ecx, [drain_byte]
+    mov edx, 1
+    int 0x80
+    test eax, eax
+    jle .drained
+    cmp byte [drain_byte], 0Ah
+    jne .drain
+.drained:
+    pop ecx
+
+.terminate:
+    mov byte [input + ecx], 0
+    mov eax, ecx
+    ret
+
+; ----------------------------------------------------------------
+; get_hit_or_stand - prompt until the answer is h or s, returns AL = 'h' or 's'
+; Upper case is accepted. The prompt is written directly so it shows before read blocks.
+; Modifies: EAX, EBX, ECX, EDX
+; ----------------------------------------------------------------
+get_hit_or_stand:
+    call obuf_flush
+.read:
+    mov eax, 4
+    mov ebx, 1
+    lea ecx, [hit_msg]
+    mov edx, hit_msg_len
+    int 0x80
+
+    call read_line
+    mov al, [input]
+    cmp al, 'A'
+    jb .check
+    cmp al, 'Z'
+    ja .check
+    or al, 0x20                     ; to lower case
+.check:
+    cmp al, 'h'
+    je .done
+    cmp al, 's'
+    je .done
+
+    mov eax, 4
+    mov ebx, 1
+    lea ecx, [invalid_act_msg]
+    mov edx, invalid_act_msg_len
+    int 0x80
+    jmp .read
+.done:
+    ret
+
+; ----------------------------------------------------------------
+; ask_replay - prompt until the answer is y or n, returns AL = 'y' or 'n'
+; Modifies: EAX, EBX, ECX, EDX
+; ----------------------------------------------------------------
+ask_replay:
+    call obuf_flush
+.read:
+    mov eax, 4
+    mov ebx, 1
+    lea ecx, [replay_msg]
+    mov edx, replay_msg_len
+    int 0x80
+
+    call read_line
+    mov al, [input]
+    cmp al, 'A'
+    jb .check
+    cmp al, 'Z'
+    ja .check
+    or al, 0x20
+.check:
+    cmp al, 'y'
+    je .done
+    cmp al, 'n'
+    je .done
+
+    mov eax, 4
+    mov ebx, 1
+    lea ecx, [invalid_act_msg]
+    mov edx, invalid_act_msg_len
+    int 0x80
+    jmp .read
+.done:
+    ret
+
+; ----------------------------------------------------------------
+; get_bet - prompt for a bet until it is a number from 1 to the balance,
+; and store it in [bet_amount]
+; The number is parsed against the balance digit by digit, so it cannot overflow
+; Modifies: EAX, EBX, ECX, EDX, ESI
+; ----------------------------------------------------------------
+get_bet:
+    call obuf_flush
+.prompt:
+    mov eax, 4
+    mov ebx, 1
+    lea ecx, [bet_msg]
+    mov edx, bet_msg_len
+    int 0x80
+
+    call read_line
+    test eax, eax
+    jz .bad                         ; empty line
+
+    ; every character must be a digit
+    lea esi, [input]
+    xor ecx, ecx
+.validate:
+    mov al, [esi + ecx]
+    test al, al
+    jz .parse_start
+    cmp al, '0'
+    jb .bad
+    cmp al, '9'
+    ja .bad
+    inc ecx
+    jmp .validate
+
+.parse_start:
+    ; limit = balance, keep limit / 10 in EBX and limit % 10 on the stack
+    mov eax, [money]
+    xor edx, edx
+    mov ecx, 10
+    div ecx                         ; EAX = limit / 10, EDX = limit % 10
+    mov ebx, eax
+    push edx
+
+    xor eax, eax                    ; parsed value
+    lea esi, [input]
+.parse:
+    movzx ecx, byte [esi]
+    test cl, cl
+    jz .parse_done
+    sub cl, '0'
+
+    cmp eax, ebx                    ; parsed > limit / 10, next digit would exceed
+    ja .too_big
+    jb .ok_digit
+    cmp ecx, [esp]                  ; parsed == limit / 10, digit decides
+    ja .too_big
+.ok_digit:
+    imul eax, 10
+    add eax, ecx
+    inc esi
+    jmp .parse
+
+.too_big:
+    pop edx
+.bad:
+    mov eax, 4
+    mov ebx, 1
+    lea ecx, [invalid_bet_msg]
+    mov edx, invalid_bet_msg_len
+    int 0x80
+    jmp .prompt
+
+.parse_done:
+    pop edx
+    test eax, eax                   ; a bet of 0 is not allowed
+    jz .bad
+    mov [bet_amount], eax
+    ret
+
+; ----------------------------------------------------------------
+; dealer_turn - show the hole card and draw until the score is 17 or more
+; The dealer stands on every 17, soft 17 included
+; ----------------------------------------------------------------
 dealer_turn:
-    pushad
-    ; reveal dealer
     mov byte [phase], 1
     call print_hand_state
-
-.dealer_loop_start:
-    ; compute dealer score
+.loop:
     lea esi, [dealer_cards]
     mov ecx, [dealer_card_count]
     mov edx, [dealer_ace_count]
-    call calculate_score    ; EAX = dealer score
+    call calculate_score
     cmp eax, 17
-    jb .dealer_do_hit
-    ; if 17 or more, stop
-    jmp .dealer_done
-
-.dealer_do_hit:
+    jge .done
     call dealer_hit
-    ; print new state
     call print_hand_state
-    jmp .dealer_loop_start
-
-.dealer_done:
-    popad
+    jmp .loop
+.done:
     ret
 
+; ----------------------------------------------------------------
+; player_turn - hit or stand until the player stands, busts or holds six cards
+; The dealer keeps the hole card hidden until the player has finished,
+; even when the dealer holds a natural
+; ----------------------------------------------------------------
+player_turn:
+.loop:
+    call print_hand_state
+    call get_hit_or_stand
+    cmp al, 's'
+    je .stand
+
+    call player_hit
+    lea esi, [player_cards]
+    mov ecx, [player_card_count]
+    mov edx, [player_ace_count]
+    call calculate_score
+    cmp eax, 21
+    jg .bust
+    cmp dword [player_card_count], 6
+    jb .loop
+    ; six cards without busting is a Six-Card Charlie, the player stands automatically
+
+.stand:
+    call dealer_turn
+    jmp resolve_round
+
+.bust:
+    mov byte [phase], 1
+    call print_hand_state
+    jmp player_lost
+
+; ----------------------------------------------------------------
+; resolve_round - compare the hands after the dealer has played
+; Order: player bust, dealer bust, dealer natural, Six-Card Charlie, higher score
+; A player natural never gets here, it is settled right after the deal
+; ----------------------------------------------------------------
+resolve_round:
+    lea esi, [player_cards]
+    mov ecx, [player_card_count]
+    mov edx, [player_ace_count]
+    call calculate_score
+    push eax                        ; player score
+
+    lea esi, [dealer_cards]
+    mov ecx, [dealer_card_count]
+    mov edx, [dealer_ace_count]
+    call calculate_score
+    mov ebx, eax                    ; EBX = dealer score
+    pop eax                         ; EAX = player score
+
+    cmp eax, 21
+    jg player_lost                  ; safety, a bust is handled in player_turn
+    cmp ebx, 21
+    jg player_won                   ; dealer bust
+
+    ; a dealer natural beats every hand that is not a natural
+    cmp dword [dealer_card_count], 2
+    jne .no_dealer_natural
+    cmp ebx, 21
+    jne .no_dealer_natural
+    lea ecx, [dealer_natural_msg]
+    mov edx, dealer_natural_msg_len
+    call obuf_write_raw
+    call obuf_flush
+    jmp player_lost
+
+.no_dealer_natural:
+    ; Six-Card Charlie, six or more cards without busting
+    xor ecx, ecx
+    cmp dword [player_card_count], 6
+    setae cl
+    xor edx, edx
+    cmp dword [dealer_card_count], 6
+    setae dl
+    cmp cl, dl
+    je .compare                     ; both or neither, the scores decide
+    test cl, cl
+    jz .dealer_six
+
+    lea ecx, [six_card_msg]
+    mov edx, six_card_msg_len
+    call obuf_write_raw
+    call obuf_flush
+    jmp player_won
+
+.dealer_six:
+    lea ecx, [dealer_six_msg]
+    mov edx, dealer_six_msg_len
+    call obuf_write_raw
+    call obuf_flush
+    jmp player_lost
+
+.compare:
+    cmp eax, ebx
+    ja player_won
+    jb player_lost
+    jmp player_push
+
+; ----------------------------------------------------------------
+; Round results
+; ----------------------------------------------------------------
 player_won:
-    ; money += bet_amount (overflow kontrolü)
     mov eax, [money]
     add eax, [bet_amount]
-    jc .pw_overflow   ; unsigned overflow -> saturate to 0xFFFFFFFF
+    jc .overflow                    ; unsigned overflow, saturate
     mov [money], eax
     jmp show_result
-
-.pw_overflow:
-    mov eax, 0FFFFFFFFh
-    mov [money], eax
+.overflow:
+    mov dword [money], 0FFFFFFFFh
     jmp show_result
 
 player_lost:
-    ; money -= bet_amount (underflow kontrolü)
     mov eax, [money]
     sub eax, [bet_amount]
-    jc .pl_underflow  ; borrow => negative in unsigned => set to 0
+    jc .underflow                   ; borrow, clamp to zero
     mov [money], eax
     jmp show_result
-
-.pl_underflow:
+.underflow:
     xor eax, eax
     mov [money], eax
     jmp show_result
 
 player_natural_win:
-    pushad
-
-    ; yükle bet
-    mov eax, [bet_amount]    ; EAX = bet
-    mov ecx, eax             ; ECX = bet (kopya)
-
-    ; eax = 3 * bet  (eax = bet + 2*bet)
-    add eax, ecx             ; eax = 2*bet
-    add eax, ecx             ; eax = 3*bet
-
-    ; böl 2'ye: floor(3*bet/2)
-    shr eax, 1               ; eax = floor(3*bet/2)
-
-    ; money += eax  (overflow kontrolü)
-    mov ebx, [money]
-    add ebx, eax
-    jc .pnw_overflow         ; carry -> overflow
-
-    mov [money], ebx
-    popad
-    ret
-
-.pnw_overflow:
+    ; win = floor(3 * bet / 2) = bet + bet / 2, which avoids computing 3 * bet
+    mov eax, [bet_amount]
+    mov ecx, eax
+    shr ecx, 1
+    add eax, ecx
+    jc .overflow
+    add eax, [money]
+    jc .overflow
+    mov [money], eax
+    jmp show_result
+.overflow:
     mov dword [money], 0FFFFFFFFh
-    popad
-    ret
-
-player_push:
-    ; beraberlik - para değişmez
     jmp show_result
 
-show_result:
-    ; money to ASCII (money_str) dönüşümü
-    mov eax, [money]
-    lea edi, [money_str + 11]
-    call int_to_ascii
+player_push:
+    ; tie, the balance does not change
 
-    ; "Bakiyeniz: " mesajı
-    mov eax, 4
-    mov ebx, 1
+show_result:
     lea ecx, [money_msg]
     mov edx, money_msg_len
-    int 0x80
+    call obuf_write_raw
+    mov eax, [money]
+    call uint_to_obuf
+    mov al, 0Ah
+    call obuf_write_char
+    call obuf_flush
 
-    ; money_str yazdır
-    mov eax, money_str
-    add eax, 11
-    sub eax, edi
-    mov edx, eax
-	mov ecx, edi
-
-    mov eax, 4
-	mov ebx, 1
-    int 0x80
-
-    ; newline
-    mov eax, 4
-    mov ebx, 1
-    lea ecx, [newline]
-    mov edx, 1
-    int 0x80
-
-    ; money güncellendikten sonra para 0 mı kontrol et
     cmp dword [money], 0
-    jne .ask_replay_label   ; para > 0 ise yeniden oynama sorusuna git
+    jne .ask_replay
 
-    ; para 0 ise oyun bitti mesajı göster ve çık
-    lea eax, [game_over_msg]
-    call print_cstr
-    je .do_exit             ; exite git
+    lea ecx, [game_over_msg]
+    mov edx, game_over_msg_len
+    call obuf_write_raw
+    call obuf_flush
+    jmp do_exit
 
-.ask_replay_label:
-    ; ask replay
+.ask_replay:
     call ask_replay
-    mov al, [tmp_buf]
     cmp al, 'y'
     je start_round
-    cmp al, 'n'
-    je .do_exit
-    jmp ask_replay
 
-.do_exit:
-	lea eax, [ending_msg]
-	call print_cstr
-    mov eax,1
-    xor ebx,ebx
+do_exit:
+    call obuf_flush
+    mov eax, 4
+    mov ebx, 1
+    lea ecx, [ending_msg]
+    mov edx, ending_msg_len
     int 0x80
+    mov eax, 1
+    xor ebx, ebx
+    int 0x80
+
+; ----------------------------------------------------------------
+; _start - seed the RNG, set the starting balance and play the first round
+; ----------------------------------------------------------------
+_start:
+    rdtsc                           ; read once, only as the seed
+    mov [rng_state], eax
+    mov dword [money], 100
+
+; ----------------------------------------------------------------
+; start_round - reset the deck and counters, deal, take the bet
+; ----------------------------------------------------------------
+start_round:
+    call init_deck
+    mov byte [phase], 0
+    xor eax, eax
+    mov [player_card_count], eax
+    mov [dealer_card_count], eax
+    mov [player_ace_count],  eax
+    mov [dealer_ace_count],  eax
+
+    call player_hit
+    call player_hit
+    call dealer_hit
+    call dealer_hit
+
+    lea ecx, [welcome_msg]
+    mov edx, welcome_msg_len
+    call obuf_write_raw
+
+    lea ecx, [money_msg]
+    mov edx, money_msg_len
+    call obuf_write_raw
+
+    mov eax, [money]
+    call uint_to_obuf
+    mov al, 0Ah
+    call obuf_write_char
+    call obuf_flush
+
+    call get_bet
+
+    ; a player natural (21 with the first two cards) is settled at once
+    lea esi, [player_cards]
+    mov ecx, 2
+    mov edx, [player_ace_count]
+    call calculate_score
+    cmp eax, 21
+    jne player_turn
+
+    ; show the dealer hand, a dealer natural as well makes it a push
+    mov byte [phase], 1
+    lea esi, [dealer_cards]
+    mov ecx, 2
+    mov edx, [dealer_ace_count]
+    call calculate_score
+    cmp eax, 21
+    je .both_natural
+
+    call print_hand_state
+    lea ecx, [natural_msg]
+    mov edx, natural_msg_len
+    call obuf_write_raw
+    call obuf_flush
+    jmp player_natural_win
+
+.both_natural:
+    call print_hand_state
+    lea ecx, [push_natural_msg]
+    mov edx, push_natural_msg_len
+    call obuf_write_raw
+    call obuf_flush
+    jmp player_push
